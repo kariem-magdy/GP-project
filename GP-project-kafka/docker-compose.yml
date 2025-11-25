@@ -1,112 +1,98 @@
 version: '3.8'
 
 services:
-  # --- ZOOKEEPER ---
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
-    hostname: zookeeper
-    container_name: zookeeper
-    ports:
-      - "2181:2181"
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-    healthcheck:
-      test: ["CMD", "bash", "-c", "echo 'ruok' | nc localhost 2181"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # --- KAFKA BROKER ---
-  broker:
-    image: confluentinc/cp-kafka:7.4.0
-    hostname: broker
-    container_name: broker
-    depends_on:
-      zookeeper:
-        condition: service_healthy
     ports:
-      - "9092:9092"     # external access
-      - "29092:29092"   # internal docker network
-      - "9101:9101"
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_JMX_PORT: 9101
-      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      # Listen on all interfaces inside container; advertise internal and host addresses
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
     healthcheck:
-      test: ["CMD", "bash", "-c", "nc -z localhost 29092"]
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
-  # --- POSTGRES (optional for Flink or sinks) ---
+  init-kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    restart: "no"
+    depends_on:
+      - kafka
+    entrypoint: ["bash", "-c"]
+    command: >
+      "echo 'Waiting for Kafka to be ready...';
+       cub kafka-ready -b kafka:9092 1 20 || exit 1;
+       kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 1 --replication-factor 1 --topic wazuh_alerts;
+       kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 1 --replication-factor 1 --topic keycloak_events;
+       kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 1 --replication-factor 1 --topic haproxy_logs;
+       kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 1 --replication-factor 1 --topic prometheus_metrics;
+       echo 'Topics created.';"
+
+  # --- FLINK CLUSTER ---
+  jobmanager:
+    image: flink:1.19.0-java11
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+    depends_on:
+      - kafka
+
+  taskmanager:
+    image: flink:1.19.0-java11
+    restart: unless-stopped
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+
+  # --- STORAGE ---
   postgres:
-    image: postgres:latest
-    container_name: postgres
+    image: postgres:15
+    restart: unless-stopped
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: postgres
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      POSTGRES_USER: "flink"
+      POSTGRES_PASSWORD: "flink"
+      POSTGRES_DB: "ueba"
+    volumes:
+      - ./init-db:/docker-entrypoint-initdb.d
 
-  # --- ELASTICSEARCH ---
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.1
-    container_name: es-container
-    environment:
-      - xpack.security.enabled=false
-      - discovery.type=single-node
-    ports:
-      - "9200:9200"
-
-  # --- KIBANA ---
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.11.1
-    container_name: kb-container
-    environment:
-      - ELASTICSEARCH_HOSTS=http://es-container:9200
-    depends_on:
-      - elasticsearch
-    ports:
-      - "5601:5601"
-
-  # --- KAFKA UI (for topic monitoring) ---
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    container_name: kafka-ui
-    ports:
-      - "8080:8080"
-    depends_on:
-      - broker
-    environment:
-      KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker:29092
-      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
-
-  # --- PYTHON PRODUCERS ---
+  # --- DATA GENERATORS / PRODUCERS ---
   producers:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: kafka-producers
     depends_on:
-      broker:
-        condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-    command: ["python", "main_producers.py"]
+      - init-kafka
+    restart: on-failure
