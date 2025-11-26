@@ -4,14 +4,43 @@ import random
 import uuid
 from datetime import datetime, timezone
 from kafka import KafkaProducer
+from kafka.errors import NoBrokersAvailable
 from faker import Faker
 
-# Initialize Faker and Kafka Producer
+# Initialize Faker
 fake = Faker()
-producer = KafkaProducer(
-    bootstrap_servers='localhost:29092', # Use localhost if running script from host, use 'kafka:9092' if inside docker
-    value_serializer=lambda v: json.dumps(v).encode('utf-8')
-)
+
+# Initialize Kafka Producer with retry logic
+def create_kafka_producer(max_retries=30, retry_delay=2):
+    """Create Kafka producer with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            print(f"Attempting to connect to Kafka (attempt {attempt + 1}/{max_retries})...")
+            producer = KafkaProducer(
+                bootstrap_servers='kafka:9092',
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                api_version=(2, 5, 0),
+                request_timeout_ms=30000,
+                max_block_ms=30000
+            )
+            print("Successfully connected to Kafka!")
+            return producer
+        except NoBrokersAvailable as e:
+            print(f"Kafka not ready yet: {e}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print("Failed to connect to Kafka after all retries")
+                raise
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                raise
+
+producer = create_kafka_producer()
 
 # --- CONFIGURATION ---
 TOPICS = {
@@ -70,6 +99,7 @@ def gen_haproxy(user):
         "bytes_read": random.randint(100, 5000)
     }
     producer.send(TOPICS["haproxy"], msg)
+    print(f"[HAProxy] Sent {method} {path} ({status}) for {user['name']}")
 
 def gen_wazuh(user):
     """Generates Endpoint Security Alerts"""

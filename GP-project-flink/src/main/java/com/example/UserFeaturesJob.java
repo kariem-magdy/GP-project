@@ -18,9 +18,6 @@ import org.apache.flink.util.Collector;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Collections;
-import java.util.List;
-import com.fasterxml.jackson.core.type.TypeReference;
 
 public class UserFeaturesJob {
     
@@ -32,11 +29,12 @@ public class UserFeaturesJob {
         // --- 1. Sources ---
         
         // We use 'valueOnly' because our JSONDeserializer implements the standard DeserializationSchema
+        // Use kafka:9092 for inter-container communication
         KafkaSource<JsonNode> keycloakSource = KafkaSource.<JsonNode>builder()
                 .setBootstrapServers("kafka:9092")
                 .setTopics("keycloak_events")
                 .setGroupId("ueba-group-keycloak")
-                .setStartingOffsets(OffsetsInitializer.latest())
+                .setStartingOffsets(OffsetsInitializer.earliest())
                 .setDeserializer(KafkaRecordDeserializationSchema.valueOnly(new JSONDeserializer()))
                 .build();
 
@@ -44,7 +42,7 @@ public class UserFeaturesJob {
                 .setBootstrapServers("kafka:9092")
                 .setTopics("haproxy_logs")
                 .setGroupId("ueba-group-haproxy")
-                .setStartingOffsets(OffsetsInitializer.latest())
+                .setStartingOffsets(OffsetsInitializer.earliest())
                 .setDeserializer(KafkaRecordDeserializationSchema.valueOnly(new JSONDeserializer()))
                 .build();
 
@@ -52,7 +50,7 @@ public class UserFeaturesJob {
                 .setBootstrapServers("kafka:9092")
                 .setTopics("wazuh_alerts")
                 .setGroupId("ueba-group-wazuh")
-                .setStartingOffsets(OffsetsInitializer.latest())
+                .setStartingOffsets(OffsetsInitializer.earliest())
                 .setDeserializer(KafkaRecordDeserializationSchema.valueOnly(new JSONDeserializer()))
                 .build();
 
@@ -60,16 +58,18 @@ public class UserFeaturesJob {
                 .setBootstrapServers("kafka:9092")
                 .setTopics("prometheus_metrics")
                 .setGroupId("ueba-group-prom")
-                .setStartingOffsets(OffsetsInitializer.latest())
+                .setStartingOffsets(OffsetsInitializer.earliest())
                 .setDeserializer(KafkaRecordDeserializationSchema.valueOnly(new JSONDeserializer()))
                 .build();
 
         // --- 2. Map Sources to Unified Event POJO with Watermarks ---
         
-        // Define watermark strategy once
+        // Define watermark strategy once with idleness timeout
+        // This allows windows to trigger even if some sources haven't sent data
         WatermarkStrategy<Event> watermarkStrategy = WatermarkStrategy
             .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(20))
-            .withTimestampAssigner((event, timestamp) -> event.timestamp);
+            .withTimestampAssigner((event, timestamp) -> event.timestamp)
+            .withIdleness(Duration.ofSeconds(30));
 
         DataStream<Event> keycloakStream = env.fromSource(
                 keycloakSource, 
@@ -114,12 +114,12 @@ public class UserFeaturesJob {
 
         // --- 4. Windowing & Aggregation ---
         // Add logging to see if events are flowing through
-        unifiedStream.map(e -> {
+        DataStream<Event> loggedStream = unifiedStream.map(e -> {
             System.out.println("Processing event: " + e.eventType + " for user " + e.userId + " at " + e.timestamp);
             return e;
         });
         
-        DataStream<UserFeatures> features = unifiedStream
+        DataStream<UserFeatures> features = loggedStream
             .keyBy(e -> e.userId)
             .window(TumblingEventTimeWindows.of(Time.minutes(5)))
             .aggregate(new FeatureAggregator(), new FeatureWindowProcessor());
@@ -292,9 +292,13 @@ public class UserFeaturesJob {
             
             // Shannon Entropy for API paths
             double entropy = 0.0;
-            for (long count : agg.apiPathCounts.values()) {
-                double p = (double) count / agg.apiRequestCount;
-                entropy -= p * Math.log(p) / Math.log(2);
+            if (agg.apiRequestCount > 0 && !agg.apiPathCounts.isEmpty()) {
+                for (long count : agg.apiPathCounts.values()) {
+                    double p = (double) count / agg.apiRequestCount;
+                    if (p > 0) {
+                        entropy -= p * (Math.log(p) / Math.log(2));
+                    }
+                }
             }
             feat.api_path_entropy = entropy;
             
@@ -305,6 +309,7 @@ public class UserFeaturesJob {
             feat.data_out_bytes = agg.dataOutBytes;
             feat.distinct_ip_count = agg.distinctIps.size();
 
+            System.out.println("Window triggered for user: " + key + ", windowEnd: " + feat.windowEnd);
             out.collect(feat);
         }
     }
