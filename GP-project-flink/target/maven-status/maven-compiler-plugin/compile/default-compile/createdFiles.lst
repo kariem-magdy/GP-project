@@ -1,12 +1,16 @@
-com\example\Event.class
 com\example\UserFeatures.class
 com\example\UserFeaturesJob$PrometheusEventMapper.class
 com\example\UserFeaturesJob$FeatureWindowProcessor.class
 com\example\UserFeaturesJob$KeycloakEventMapper.class
+com\example\HaproxyEvent.class
 com\example\JdbcUserFeaturesSink.class
 com\example\UserFeaturesJob$WazuhEventMapper.class
+com\example\WazuhEvent.class
 com\example\UserFeaturesJob.class
 com\example\UserFeaturesJob$FeatureAggregator.class
 com\example\UserFeaturesJob$JSONDeserializer.class
 com\example\PerFiveMinAgg.class
 com\example\UserFeaturesJob$HaproxyEventMapper.class
+com\example\BaseEvent.class
+com\example\PrometheusEvent.class
+com\example\KeycloakEvent.class

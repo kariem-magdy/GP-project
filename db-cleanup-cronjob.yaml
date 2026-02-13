@@ -1,0 +1,57 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-cleanup-old-features
+  labels:
+    app: ueba-pipeline
+    component: maintenance
+spec:
+  # Run daily at 02:00 UTC
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        metadata:
+          labels:
+            app: ueba-pipeline
+            component: db-cleanup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: pg-cleanup
+              image: postgres:15
+              command:
+                - "psql"
+                - "-h"
+                - "$(DB_HOST)"
+                - "-U"
+                - "$(DB_USER)"
+                - "-d"
+                - "$(DB_NAME)"
+                - "-c"
+                - "DELETE FROM user_features WHERE windowEnd < NOW() - INTERVAL '7 days';"
+              env:
+                - name: DB_HOST
+                  valueFrom:
+                    configMapKeyRef:
+                      name: ueba-db-config
+                      key: host
+                - name: DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: ueba-db-credentials
+                      key: username
+                - name: DB_NAME
+                  valueFrom:
+                    configMapKeyRef:
+                      name: ueba-db-config
+                      key: database
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: ueba-db-credentials
+                      key: password

@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import random
 import uuid
@@ -10,14 +11,17 @@ from faker import Faker
 # Initialize Faker
 fake = Faker()
 
+# Upgrade #4: Read bootstrap servers from environment variable
+KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+
 # Initialize Kafka Producer with retry logic
 def create_kafka_producer(max_retries=30, retry_delay=2):
     """Create Kafka producer with retry logic"""
     for attempt in range(max_retries):
         try:
-            print(f"Attempting to connect to Kafka (attempt {attempt + 1}/{max_retries})...")
+            print(f"Attempting to connect to Kafka at {KAFKA_BOOTSTRAP_SERVERS} (attempt {attempt + 1}/{max_retries})...")
             producer = KafkaProducer(
-                bootstrap_servers='kafka:9092',
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
                 value_serializer=lambda v: json.dumps(v).encode('utf-8'),
                 api_version=(2, 5, 0),
                 request_timeout_ms=30000,
@@ -65,10 +69,10 @@ def get_time_now():
 def gen_keycloak(user):
     """Generates Identity/Auth events"""
     event_type = random.choices(
-        ["LOGIN", "LOGIN_ERROR", "REFRESH_TOKEN", "LOGOUT"], 
+        ["LOGIN", "LOGIN_ERROR", "REFRESH_TOKEN", "LOGOUT"],
         weights=[0.7, 0.05, 0.2, 0.05]
     )[0]
-    
+
     msg = {
         "time": int(time.time() * 1000), # Flink likes epoch millis
         "type": event_type,
@@ -87,7 +91,7 @@ def gen_haproxy(user):
     path = random.choice(["/api/v1/data", "/api/v1/user", "/api/v1/admin", "/login", "/static/css"])
     method = random.choice(["GET", "POST", "DELETE"])
     status = random.choices([200, 401, 403, 500], weights=[0.9, 0.05, 0.03, 0.02])[0]
-    
+
     msg = {
         "timestamp": get_time_now(),
         "client_ip": user["ip"],
@@ -108,7 +112,7 @@ def gen_wazuh(user):
 
     rule_id = random.choice(["5715", "5710", "550", "10000"])  # SSH Success, SSH Fail, File Mod, Mimikatz
     level = 3 if rule_id == "5715" else random.randint(5, 12)
-    
+
     msg = {
         "timestamp": get_time_now(),
         "rule": {
@@ -128,7 +132,7 @@ def gen_wazuh(user):
 def gen_prometheus(user):
     """Generates System Metrics linked to User's Pod/Container"""
     metrics = ["agent_cpu_avg", "agent_mem_avg", "agent_net_out_sum_bytes"]
-    
+
     for m in metrics:
         msg = {
             "timestamp": int(time.time() * 1000),

@@ -35,7 +35,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # --- AUTO TOPIC CREATION ---
+  # --- AUTO TOPIC CREATION (Upgrade #1: 4 partitions for parallelism) ---
   init-kafka:
     image: confluentinc/cp-kafka:7.4.0
     depends_on:
@@ -46,33 +46,40 @@ services:
       "
       # Blocks until kafka is reachable
       kafka-topics --bootstrap-server kafka:9092 --list
-      
-      echo -e 'Creating kafka topics'
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic wazuh_alerts --replication-factor 1 --partitions 1
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic keycloak_events --replication-factor 1 --partitions 1
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic haproxy_logs --replication-factor 1 --partitions 1
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic prometheus_metrics --replication-factor 1 --partitions 1
-      
+
+      echo -e 'Creating kafka topics with 4 partitions'
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic wazuh_alerts --replication-factor 1 --partitions 4
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic keycloak_events --replication-factor 1 --partitions 4
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic haproxy_logs --replication-factor 1 --partitions 4
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic prometheus_metrics --replication-factor 1 --partitions 4
+
       echo -e 'Successfully created the following topics:'
       kafka-topics --bootstrap-server kafka:9092 --list
       "
 
-  # --- FLINK CLUSTER ---
+  # --- FLINK CLUSTER (Upgrade #6: standalone-job with custom image) ---
   jobmanager:
-    image: flink:1.19.0-java11
+    build:
+      context: ./GP-project-flink
+      dockerfile: Dockerfile
     container_name: flink-jobmanager
     ports:
       - "8081:8081"
-    command: jobmanager
+    command: standalone-job --job-classname com.example.UserFeaturesJob --kafka.bootstrap.servers kafka:9092 --db.url jdbc:postgresql://postgres:5432/ueba --db.user flink --db.password flink
     environment:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
     depends_on:
-      - kafka
+      init-kafka:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   taskmanager:
-    image: flink:1.19.0-java11
+    build:
+      context: ./GP-project-flink
+      dockerfile: Dockerfile
     container_name: flink-taskmanager
     depends_on:
       - jobmanager
@@ -105,7 +112,6 @@ services:
   # --- DATA GENERATORS ---
   producers:
     build:
-      # UPDATED CONTEXT: Tells docker to build from the GP-project-kafka folder
       context: ./GP-project-kafka
       dockerfile: Dockerfile
     container_name: python-producers
