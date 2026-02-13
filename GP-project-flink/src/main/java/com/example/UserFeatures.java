@@ -20,4 +20,9 @@ public class UserFeatures implements Serializable {
     public double avg_cpu_usage;
 
     public UserFeatures() {}
+
+    // Getter for Kafka key-based partitioning
+    public String getUserId() {
+        return userId;
+    }
 }

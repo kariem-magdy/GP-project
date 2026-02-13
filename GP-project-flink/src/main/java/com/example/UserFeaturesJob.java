@@ -6,6 +6,9 @@ import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.connector.base.DeliveryGuarantee;
+import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
+import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
@@ -15,9 +18,12 @@ import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.assigners.SlidingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
+import org.apache.kafka.clients.producer.ProducerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 
@@ -134,16 +140,26 @@ public class UserFeaturesJob {
             return e;
         });
 
-        // Upgrade #2: Sliding Window (5-minute window, slides every 1 minute)
-        // Upgrade #9: Using Duration API instead of deprecated Time
+        // Sliding Window (5-minute window, slides every 1 minute)
         DataStream<UserFeatures> features = loggedStream
             .keyBy(e -> e.userId)
             .window(SlidingEventTimeWindows.of(Duration.ofMinutes(5), Duration.ofMinutes(1)))
             .aggregate(new FeatureAggregator(), new FeatureWindowProcessor());
 
-        // --- 5. Sink ---
-        // Upgrade #3: Pass DB connection parameters from ParameterTool
+        // --- 5. Sinks (Dual Output: PostgreSQL + Kafka) ---
+
+        // Sink #1: PostgreSQL (existing)
         features.addSink(new JdbcUserFeaturesSink(dbUrl, dbUser, dbPassword));
+
+        // Sink #2: Kafka (new - for ML pipeline consumption)
+        KafkaSink<UserFeatures> kafkaSink = KafkaSink.<UserFeatures>builder()
+            .setBootstrapServers(kafkaBrokers)
+            .setRecordSerializer(new UserFeaturesKafkaSerializer("ueba-features-stream"))
+            .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+            .build();
+
+        features.sinkTo(kafkaSink);
+        LOG.info("Kafka Sink configured for topic: ueba-features-stream");
 
         env.execute("UEBA Feature Engineering");
     }
@@ -329,6 +345,36 @@ public class UserFeaturesJob {
 
             LOG.info("Window triggered for user: {}, windowEnd: {}", key, feat.windowEnd);
             out.collect(feat);
+        }
+    }
+
+    // --- Kafka Serialization Schema (Key = userId, Value = JSON) ---
+
+    public static class UserFeaturesKafkaSerializer implements KafkaRecordSerializationSchema<UserFeatures> {
+        private static final long serialVersionUID = 1L;
+        private static final ObjectMapper mapper = new ObjectMapper();
+        private final String topic;
+
+        public UserFeaturesKafkaSerializer(String topic) {
+            this.topic = topic;
+        }
+
+        @Nullable
+        @Override
+        public ProducerRecord<byte[], byte[]> serialize(UserFeatures userFeatures, KafkaRecordSerializationSchema.KafkaSinkContext context, Long timestamp) {
+            try {
+                // Key = userId (ensures all events for a user go to the same partition)
+                byte[] key = userFeatures.getUserId() != null 
+                    ? userFeatures.getUserId().getBytes(StandardCharsets.UTF_8) 
+                    : null;
+                
+                // Value = JSON serialized UserFeatures
+                byte[] value = mapper.writeValueAsBytes(userFeatures);
+                
+                return new ProducerRecord<>(topic, null, timestamp, key, value);
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to serialize UserFeatures to Kafka", e);
+            }
         }
     }
 }

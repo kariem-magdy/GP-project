@@ -5,7 +5,12 @@
 *.ear
 *.log
 target/
+**/target/
 !.mvn/wrapper/maven-wrapper.jar
+
+# Flink build artifacts
+GP-project-flink/target/
+GP-project-flink/*.jar
 
 # Python
 __pycache__/
