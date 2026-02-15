@@ -1,6 +1,8 @@
 package com.example;
 
 import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
 
 public class UserFeatures implements Serializable {
     private static final long serialVersionUID = 1L;
@@ -8,7 +10,7 @@ public class UserFeatures implements Serializable {
     public long windowEnd;
     public String windowEndStr;
 
-    // ML Features
+    // ML Features (individual columns — consumed by PostgreSQL sink)
     public double login_fail_rate;
     public int distinct_ip_count;
     public long api_request_count;
@@ -18,6 +20,14 @@ public class UserFeatures implements Serializable {
     public long high_sev_alert_count;
     public double avg_wazuh_level;
     public double avg_cpu_usage;
+
+    // Dual-Payload fields (consumed by Kafka sink for Multi-Modal DL model)
+    public List<Double> aggregateVector = new ArrayList<>();
+    public List<String> rawEventSequence = new ArrayList<>();
+
+    // DDoS / Log-Flood detection fields
+    public long totalEventCount;
+    public boolean limitExceeded;
 
     public UserFeatures() {}
 

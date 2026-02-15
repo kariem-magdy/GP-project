@@ -1,8 +1,10 @@
 package com.example;
 
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -26,6 +28,12 @@ public class PerFiveMinAgg implements Serializable {
     
     public double cpuSum = 0;
     public long cpuCount = 0;
+
+    // Chronological sequence of lightweight event descriptions for the ML sequence model
+    public List<String> rawEventSequence = new ArrayList<>();
+
+    // Total events seen in this window (never capped — used for DDoS/flood detection)
+    public long totalEventCount = 0;
 
     public PerFiveMinAgg() {}
 }

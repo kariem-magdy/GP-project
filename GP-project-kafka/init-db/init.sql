@@ -18,7 +18,13 @@ CREATE TABLE IF NOT EXISTS user_features (
     
     -- System
     avg_cpu_usage DOUBLE PRECISION,
-    
+
+    -- AI / DDoS detection (consumed by ML pipeline)
+    total_event_count INT DEFAULT 0,
+    limit_exceeded BOOLEAN DEFAULT FALSE,
+    aggregate_vector FLOAT8[] DEFAULT '{}',
+    raw_event_sequence TEXT[] DEFAULT '{}',
+
     PRIMARY KEY (userId, windowEnd)
 );
 

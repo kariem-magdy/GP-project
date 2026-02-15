@@ -93,7 +93,7 @@ def gen_haproxy(user):
     status = random.choices([200, 401, 403, 500], weights=[0.9, 0.05, 0.03, 0.02])[0]
 
     msg = {
-        "timestamp": get_time_now(),
+        "timestamp": int(time.time() * 1000),  # epoch millis (matches Flink asLong)
         "client_ip": user["ip"],
         "jwt_user_id": user["id"], # EXTRACTED FROM TOKEN
         "http_method": method,
@@ -114,7 +114,7 @@ def gen_wazuh(user):
     level = 3 if rule_id == "5715" else random.randint(5, 12)
 
     msg = {
-        "timestamp": get_time_now(),
+        "timestamp": int(time.time() * 1000),  # epoch millis (matches Flink asLong)
         "rule": {
             "level": level,
             "id": rule_id,

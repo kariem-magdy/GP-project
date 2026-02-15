@@ -25,7 +25,6 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.time.Instant;
 
 public class UserFeaturesJob {
 
@@ -146,20 +145,24 @@ public class UserFeaturesJob {
             .window(SlidingEventTimeWindows.of(Duration.ofMinutes(5), Duration.ofMinutes(1)))
             .aggregate(new FeatureAggregator(), new FeatureWindowProcessor());
 
-        // --- 5. Sinks (Dual Output: PostgreSQL + Kafka) ---
+        // --- 5. Sinks (Dual Output: PostgreSQL + Kafka, decoupled for parallel execution) ---
 
-        // Sink #1: PostgreSQL (existing)
-        features.addSink(new JdbcUserFeaturesSink(dbUrl, dbUser, dbPassword));
+        // Sink #1: PostgreSQL — persists columnar features for dashboards & historical queries
+        features.addSink(new JdbcUserFeaturesSink(dbUrl, dbUser, dbPassword))
+            .name("PostgreSQL-UEBA-Sink")
+            .disableChaining();
 
-        // Sink #2: Kafka (new - for ML pipeline consumption)
+        // Sink #2: Kafka — broadcasts dual-payload JSON for real-time ML inference
         KafkaSink<UserFeatures> kafkaSink = KafkaSink.<UserFeatures>builder()
             .setBootstrapServers(kafkaBrokers)
             .setRecordSerializer(new UserFeaturesKafkaSerializer("ueba-features-stream"))
             .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
             .build();
 
-        features.sinkTo(kafkaSink);
-        LOG.info("Kafka Sink configured for topic: ueba-features-stream");
+        features.sinkTo(kafkaSink)
+            .name("Kafka-UEBA-Sink")
+            .disableChaining();
+        LOG.info("Dual sinks configured: PostgreSQL + Kafka (topic: ueba-features-stream)");
 
         env.execute("UEBA Feature Engineering");
     }
@@ -167,10 +170,17 @@ public class UserFeaturesJob {
     // --- Helpers ---
 
     public static class JSONDeserializer implements org.apache.flink.api.common.serialization.DeserializationSchema<JsonNode> {
+        private static final Logger LOG = LoggerFactory.getLogger(JSONDeserializer.class);
         private static final ObjectMapper mapper = new ObjectMapper();
         @Override
         public JsonNode deserialize(byte[] message) {
-            try { return mapper.readTree(message); } catch (Exception e) { return null; }
+            try {
+                return mapper.readTree(message);
+            } catch (Exception e) {
+                LOG.error("Failed to deserialize JSON message: {}",
+                    new String(message, StandardCharsets.UTF_8), e);
+                return null;
+            }
         }
         @Override
         public boolean isEndOfStream(JsonNode nextElement) { return false; }
@@ -202,10 +212,7 @@ public class UserFeaturesJob {
             HaproxyEvent e = new HaproxyEvent();
             if (node == null) return e;
             e.userId = node.path("jwt_user_id").asText(null);
-            try {
-                String ts = node.path("timestamp").asText();
-                e.timestamp = Instant.parse(ts).toEpochMilli();
-            } catch (Exception ex) { e.timestamp = System.currentTimeMillis(); }
+            e.timestamp = node.path("timestamp").asLong(0L);
 
             e.method = node.path("http_method").asText();
             e.path = node.path("http_path").asText();
@@ -222,10 +229,7 @@ public class UserFeaturesJob {
             WazuhEvent e = new WazuhEvent();
             if (node == null) return e;
             e.userId = node.path("userId").asText(null);
-            try {
-                String ts = node.path("timestamp").asText();
-                e.timestamp = Instant.parse(ts).toEpochMilli();
-            } catch (Exception ex) { e.timestamp = System.currentTimeMillis(); }
+            e.timestamp = node.path("timestamp").asLong(0L);
 
             e.level = node.path("rule").path("level").asInt();
             e.ruleId = node.path("rule").path("id").asText();
@@ -249,6 +253,8 @@ public class UserFeaturesJob {
     // --- Aggregators ---
 
     public static class FeatureAggregator implements AggregateFunction<BaseEvent, PerFiveMinAgg, PerFiveMinAgg> {
+        private static final int SEQUENCE_LIMIT = 50;
+
         @Override
         public PerFiveMinAgg createAccumulator() { return new PerFiveMinAgg(); }
 
@@ -256,33 +262,62 @@ public class UserFeaturesJob {
         public PerFiveMinAgg add(BaseEvent event, PerFiveMinAgg acc) {
             if (acc.userId == null && event.userId != null) acc.userId = event.userId;
 
+            // Always count every event (uncapped — drives DDoS detection)
+            acc.totalEventCount++;
+
+            // Dispatch to typed handler and get event description
+            String eventDesc = applyMetricsAndGetDesc(event, acc);
+
+            // Only append to the sequence if under the cap
+            if (eventDesc != null && acc.rawEventSequence.size() < SEQUENCE_LIMIT) {
+                acc.rawEventSequence.add(eventDesc);
+            }
+
+            return acc;
+        }
+
+        private String applyMetricsAndGetDesc(BaseEvent event, PerFiveMinAgg acc) {
             if (event instanceof KeycloakEvent) {
                 KeycloakEvent e = (KeycloakEvent) event;
-                if ("LOGIN_ERROR".equals(e.type)) acc.loginFailCount++;
-                else if ("LOGIN".equals(e.type)) acc.loginSuccessCount++;
+                String desc = null;
+                if ("LOGIN_ERROR".equals(e.type)) {
+                    acc.loginFailCount++;
+                    desc = "auth_fail";
+                } else if ("LOGIN".equals(e.type)) {
+                    acc.loginSuccessCount++;
+                    desc = "auth_success";
+                } else if ("REFRESH_TOKEN".equals(e.type)) {
+                    desc = "auth_refresh";
+                } else if ("LOGOUT".equals(e.type)) {
+                    desc = "auth_logout";
+                }
                 if (e.ip != null) acc.distinctIps.add(e.ip);
+                return desc;
             }
-            else if (event instanceof HaproxyEvent) {
+            if (event instanceof HaproxyEvent) {
                 HaproxyEvent e = (HaproxyEvent) event;
                 acc.apiRequestCount++;
                 acc.dataOutBytes += e.bytes;
                 if (e.status >= 400 && e.status < 500) acc.http4xxCount++;
                 if (e.path != null) acc.apiPathCounts.merge(e.path, 1L, Long::sum);
+                return e.method + " " + e.path;
             }
-            else if (event instanceof WazuhEvent) {
+            if (event instanceof WazuhEvent) {
                 WazuhEvent e = (WazuhEvent) event;
                 acc.totalAlerts++;
                 acc.alertLevelSum += e.level;
                 if (e.level >= 10) acc.highSevAlertCount++;
+                return "wazuh_alert_lvl_" + e.level;
             }
-            else if (event instanceof PrometheusEvent) {
+            if (event instanceof PrometheusEvent) {
                 PrometheusEvent e = (PrometheusEvent) event;
                 if ("agent_cpu_avg".equals(e.metricName)) {
                     acc.cpuSum += e.value;
                     acc.cpuCount++;
                 }
+                return "metric_" + e.metricName;
             }
-            return acc;
+            return null;
         }
 
         @Override
@@ -302,6 +337,14 @@ public class UserFeaturesJob {
             a.cpuSum += b.cpuSum;
             a.cpuCount += b.cpuCount;
             b.apiPathCounts.forEach((k, v) -> a.apiPathCounts.merge(k, v, Long::sum));
+            a.totalEventCount += b.totalEventCount;
+            // Merge sequences: combine fully, then keep only the LAST 50 (most recent)
+            a.rawEventSequence.addAll(b.rawEventSequence);
+            if (a.rawEventSequence.size() > SEQUENCE_LIMIT) {
+                a.rawEventSequence = new java.util.ArrayList<>(
+                    a.rawEventSequence.subList(a.rawEventSequence.size() - SEQUENCE_LIMIT, a.rawEventSequence.size())
+                );
+            }
             return a;
         }
     }
@@ -343,12 +386,32 @@ public class UserFeaturesJob {
             feat.data_out_bytes = agg.dataOutBytes;
             feat.distinct_ip_count = agg.distinctIps.size();
 
-            LOG.info("Window triggered for user: {}, windowEnd: {}", key, feat.windowEnd);
+            // Pack all computed metrics into the aggregate vector for the DL model
+            feat.aggregateVector = new java.util.ArrayList<>(9);
+            feat.aggregateVector.add(feat.login_fail_rate);
+            feat.aggregateVector.add((double) feat.distinct_ip_count);
+            feat.aggregateVector.add((double) feat.api_request_count);
+            feat.aggregateVector.add(feat.http_4xx_rate);
+            feat.aggregateVector.add((double) feat.data_out_bytes);
+            feat.aggregateVector.add(feat.api_path_entropy);
+            feat.aggregateVector.add((double) feat.high_sev_alert_count);
+            feat.aggregateVector.add(feat.avg_wazuh_level);
+            feat.aggregateVector.add(feat.avg_cpu_usage);
+
+            // Pass through the chronological raw event sequence (already capped at 50)
+            feat.rawEventSequence = agg.rawEventSequence;
+
+            // DDoS / Log-Flood detection: total uncapped count and limit flag
+            feat.totalEventCount = agg.totalEventCount;
+            feat.limitExceeded = agg.totalEventCount > 50;
+
+            LOG.info("Window triggered for user: {}, windowEnd: {}, totalEvents: {}, sequenceSize: {}, limitExceeded: {}",
+                key, feat.windowEnd, feat.totalEventCount, feat.rawEventSequence.size(), feat.limitExceeded);
             out.collect(feat);
         }
     }
 
-    // --- Kafka Serialization Schema (Key = userId, Value = JSON) ---
+    // --- Kafka Serialization Schema: Dual-Payload JSON for Multi-Modal DL ---
 
     public static class UserFeaturesKafkaSerializer implements KafkaRecordSerializationSchema<UserFeatures> {
         private static final long serialVersionUID = 1L;
@@ -361,16 +424,33 @@ public class UserFeaturesJob {
 
         @Nullable
         @Override
-        public ProducerRecord<byte[], byte[]> serialize(UserFeatures userFeatures, KafkaRecordSerializationSchema.KafkaSinkContext context, Long timestamp) {
+        public ProducerRecord<byte[], byte[]> serialize(UserFeatures feat, KafkaRecordSerializationSchema.KafkaSinkContext context, Long timestamp) {
             try {
                 // Key = userId (ensures all events for a user go to the same partition)
-                byte[] key = userFeatures.getUserId() != null 
-                    ? userFeatures.getUserId().getBytes(StandardCharsets.UTF_8) 
+                byte[] key = feat.getUserId() != null
+                    ? feat.getUserId().getBytes(StandardCharsets.UTF_8)
                     : null;
-                
-                // Value = JSON serialized UserFeatures
-                byte[] value = mapper.writeValueAsBytes(userFeatures);
-                
+
+                // Build the dual-payload JSON structure
+                com.fasterxml.jackson.databind.node.ObjectNode root = mapper.createObjectNode();
+                root.put("user_id", feat.userId);
+                root.put("window_end", feat.windowEndStr != null ? feat.windowEndStr : String.valueOf(feat.windowEnd));
+                root.put("total_event_count", feat.totalEventCount);
+                root.put("limit_exceeded", feat.limitExceeded);
+
+                // aggregate_vector: all 9 computed metrics packed as a JSON array
+                com.fasterxml.jackson.databind.node.ArrayNode vectorNode = root.putArray("aggregate_vector");
+                for (Double v : feat.aggregateVector) {
+                    vectorNode.add(v);
+                }
+
+                // raw_event_sequence: chronological event descriptions
+                com.fasterxml.jackson.databind.node.ArrayNode seqNode = root.putArray("raw_event_sequence");
+                for (String s : feat.rawEventSequence) {
+                    seqNode.add(s);
+                }
+
+                byte[] value = mapper.writeValueAsBytes(root);
                 return new ProducerRecord<>(topic, null, timestamp, key, value);
             } catch (Exception e) {
                 throw new RuntimeException("Failed to serialize UserFeatures to Kafka", e);

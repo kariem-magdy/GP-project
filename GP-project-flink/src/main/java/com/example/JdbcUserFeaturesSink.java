@@ -10,6 +10,7 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.sql.Timestamp;
+import java.sql.Array;
 
 public class JdbcUserFeaturesSink extends RichSinkFunction<UserFeatures> {
 
@@ -63,8 +64,9 @@ public class JdbcUserFeaturesSink extends RichSinkFunction<UserFeatures> {
 
         String sql = "INSERT INTO user_features (userId, windowEnd, login_fail_rate, distinct_ip_count, " +
                      "api_request_count, http_4xx_rate, data_out_bytes, api_path_entropy, " +
-                     "high_sev_alert_count, avg_wazuh_level, avg_cpu_usage) " +
-                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+                     "high_sev_alert_count, avg_wazuh_level, avg_cpu_usage, " +
+                     "total_event_count, limit_exceeded, aggregate_vector, raw_event_sequence) " +
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
                      "ON CONFLICT (userId, windowEnd) DO UPDATE SET " +
                      "login_fail_rate = EXCLUDED.login_fail_rate, " +
                      "distinct_ip_count = EXCLUDED.distinct_ip_count, " +
@@ -74,7 +76,11 @@ public class JdbcUserFeaturesSink extends RichSinkFunction<UserFeatures> {
                      "api_path_entropy = EXCLUDED.api_path_entropy, " +
                      "high_sev_alert_count = EXCLUDED.high_sev_alert_count, " +
                      "avg_wazuh_level = EXCLUDED.avg_wazuh_level, " +
-                     "avg_cpu_usage = EXCLUDED.avg_cpu_usage";
+                     "avg_cpu_usage = EXCLUDED.avg_cpu_usage, " +
+                     "total_event_count = EXCLUDED.total_event_count, " +
+                     "limit_exceeded = EXCLUDED.limit_exceeded, " +
+                     "aggregate_vector = EXCLUDED.aggregate_vector, " +
+                     "raw_event_sequence = EXCLUDED.raw_event_sequence";
         ps = connection.prepareStatement(sql);
         notifyStmt = connection.createStatement();
     }
@@ -95,6 +101,20 @@ public class JdbcUserFeaturesSink extends RichSinkFunction<UserFeatures> {
             ps.setLong(9, value.high_sev_alert_count);
             ps.setDouble(10, value.avg_wazuh_level);
             ps.setDouble(11, value.avg_cpu_usage);
+
+            // New AI / DDoS columns
+            ps.setInt(12, (int) value.totalEventCount);
+            ps.setBoolean(13, value.limitExceeded);
+
+            // List<Double> → FLOAT8[]
+            Double[] vecArray = value.aggregateVector.toArray(new Double[0]);
+            Array sqlVec = connection.createArrayOf("float8", vecArray);
+            ps.setArray(14, sqlVec);
+
+            // List<String> → TEXT[]
+            String[] seqArray = value.rawEventSequence.toArray(new String[0]);
+            Array sqlSeq = connection.createArrayOf("text", seqArray);
+            ps.setArray(15, sqlSeq);
 
             int rowsAffected = ps.executeUpdate();
             LOG.debug("Successfully inserted/updated {} rows for user: {}", rowsAffected, value.userId);
