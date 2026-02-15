@@ -1,0 +1,81 @@
+# =============================================================================
+# 07-flink-taskmanager.yaml - Flink TaskManager Deployment
+# OVERRIDE #3: imagePullPolicy: Never for local images
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+  namespace: ueba
+  labels:
+    app: ueba-pipeline
+    component: flink-taskmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ueba-pipeline
+      component: flink-taskmanager
+  template:
+    metadata:
+      labels:
+        app: ueba-pipeline
+        component: flink-taskmanager
+    spec:
+      initContainers:
+        # Wait for JobManager to be ready
+        - name: wait-for-jobmanager
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for JobManager to be ready..."
+              until nc -z flink-jobmanager 6123; do
+                echo "JobManager not ready yet, retrying in 5 seconds..."
+                sleep 5
+              done
+              echo "JobManager is ready!"
+      containers:
+        - name: taskmanager
+          # OVERRIDE #3: Local image - imagePullPolicy: Never
+          image: gp-project-flink:latest
+          imagePullPolicy: Never
+          args:
+            - taskmanager
+          ports:
+            - containerPort: 6122
+              name: rpc
+            - containerPort: 6125
+              name: query-state
+          env:
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager
+                taskmanager.numberOfTaskSlots: 4
+                taskmanager.memory.process.size: 1728m
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pgrep -f "org.apache.flink" > /dev/null
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pgrep -f "org.apache.flink" > /dev/null
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 5

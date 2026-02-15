@@ -1,0 +1,67 @@
+# =============================================================================
+# 05-init-kafka-job.yaml - Kafka Topic Initialization Job
+# OVERRIDE #1: Uses INTERNAL listener (kafka:29092) for cluster communication
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: init-kafka
+  namespace: ueba
+  labels:
+    app: ueba-pipeline
+    component: init-kafka
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        app: ueba-pipeline
+        component: init-kafka
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        # Wait for Kafka to be ready
+        - name: wait-for-kafka
+          image: confluentinc/cp-kafka:7.4.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for Kafka to be ready..."
+              until kafka-topics --bootstrap-server kafka:29092 --list > /dev/null 2>&1; do
+                echo "Kafka not ready yet, retrying in 5 seconds..."
+                sleep 5
+              done
+              echo "Kafka is ready!"
+      containers:
+        - name: init-kafka
+          image: confluentinc/cp-kafka:7.4.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "======================="
+              echo "Creating Kafka topics with 4 partitions..."
+              echo "Using INTERNAL listener: kafka:29092"
+              echo "======================="
+              
+              # Create all topics with 4 partitions for parallelism
+              kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+                --topic wazuh_alerts --replication-factor 1 --partitions 4
+              
+              kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+                --topic keycloak_events --replication-factor 1 --partitions 4
+              
+              kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+                --topic haproxy_logs --replication-factor 1 --partitions 4
+              
+              kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+                --topic prometheus_metrics --replication-factor 1 --partitions 4
+              
+              kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+                --topic ueba-features-stream --replication-factor 1 --partitions 4
+              
+              echo "======================="
+              echo "Successfully created topics:"
+              kafka-topics --bootstrap-server kafka:29092 --list
+              echo "======================="

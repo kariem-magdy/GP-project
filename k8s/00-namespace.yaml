@@ -1,0 +1,10 @@
+# =============================================================================
+# 00-namespace.yaml - UEBA Pipeline Namespace
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ueba
+  labels:
+    app: ueba-pipeline
+    environment: local

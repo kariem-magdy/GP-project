@@ -1,0 +1,183 @@
+# =============================================================================
+# 06-flink-jobmanager.yaml - Flink JobManager Deployment
+# OVERRIDE #1: Uses INTERNAL listener (kafka:29092) for cluster communication
+# OVERRIDE #3: imagePullPolicy: Never for local images
+# =============================================================================
+
+---
+# ConfigMap for Flink configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flink-config
+  namespace: ueba
+  labels:
+    app: ueba-pipeline
+    component: flink
+data:
+  flink-conf.yaml: |
+    jobmanager.rpc.address: flink-jobmanager
+    jobmanager.rpc.port: 6123
+    jobmanager.memory.process.size: 1600m
+    taskmanager.memory.process.size: 1728m
+    taskmanager.numberOfTaskSlots: 4
+    parallelism.default: 4
+    rest.address: flink-jobmanager
+    rest.port: 8081
+
+---
+# Headless Service for JobManager RPC
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager-headless
+  namespace: ueba
+  labels:
+    app: ueba-pipeline
+    component: flink-jobmanager
+spec:
+  clusterIP: None
+  selector:
+    app: ueba-pipeline
+    component: flink-jobmanager
+  ports:
+    - name: rpc
+      port: 6123
+      targetPort: 6123
+    - name: blob
+      port: 6124
+      targetPort: 6124
+    - name: webui
+      port: 8081
+      targetPort: 8081
+
+---
+# ClusterIP Service for JobManager (for UI and internal access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager
+  namespace: ueba
+  labels:
+    app: ueba-pipeline
+    component: flink-jobmanager
+spec:
+  type: ClusterIP
+  selector:
+    app: ueba-pipeline
+    component: flink-jobmanager
+  ports:
+    - name: rpc
+      port: 6123
+      targetPort: 6123
+    - name: blob
+      port: 6124
+      targetPort: 6124
+    - name: webui
+      port: 8081
+      targetPort: 8081
+
+---
+# Flink JobManager Deployment (OVERRIDE #3: imagePullPolicy: Never)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+  namespace: ueba
+  labels:
+    app: ueba-pipeline
+    component: flink-jobmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ueba-pipeline
+      component: flink-jobmanager
+  template:
+    metadata:
+      labels:
+        app: ueba-pipeline
+        component: flink-jobmanager
+    spec:
+      initContainers:
+        # Wait for Postgres to be ready
+        - name: wait-for-postgres
+          image: postgres:15
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until pg_isready -h postgres -p 5432 -U flink -d ueba; do
+                echo "Waiting for PostgreSQL..."
+                sleep 5
+              done
+              echo "PostgreSQL is ready!"
+        # Wait for Kafka topics to exist
+        - name: wait-for-kafka
+          image: confluentinc/cp-kafka:7.4.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for Kafka topics to be created..."
+              until kafka-topics --bootstrap-server kafka:29092 --list | grep -q "wazuh_alerts"; do
+                echo "Topics not ready yet, retrying..."
+                sleep 5
+              done
+              echo "Kafka topics are ready!"
+      containers:
+        - name: jobmanager
+          # OVERRIDE #3: Local image - imagePullPolicy: Never
+          image: gp-project-flink:latest
+          imagePullPolicy: Never
+          args:
+            - standalone-job
+            - --job-classname
+            - com.example.UserFeaturesJob
+            # OVERRIDE #1: Using INTERNAL listener for Kafka
+            - --kafka.bootstrap.servers
+            - kafka:29092
+            - --db.url
+            - jdbc:postgresql://postgres:5432/ueba
+            - --db.user
+            - flink
+            - --db.password
+            - flink
+          ports:
+            - containerPort: 6123
+              name: rpc
+            - containerPort: 6124
+              name: blob
+            - containerPort: 8081
+              name: webui
+          env:
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager
+                jobmanager.rpc.port: 6123
+          volumeMounts:
+            - name: flink-config-volume
+              mountPath: /opt/flink/conf/flink-conf.yaml
+              subPath: flink-conf.yaml
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          livenessProbe:
+            tcpSocket:
+              port: 6123
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /overview
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: flink-config-volume
+          configMap:
+            name: flink-config

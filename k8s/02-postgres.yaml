@@ -1,0 +1,143 @@
+# =============================================================================
+# 02-postgres.yaml - PostgreSQL StatefulSet with Persistent Storage
+# =============================================================================
+
+---
+# Headless Service for StatefulSet DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: ueba
+  labels:
+    app: ueba-pipeline
+    component: postgres
+spec:
+  clusterIP: None
+  selector:
+    app: ueba-pipeline
+    component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+
+---
+# ClusterIP Service for internal access
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: ueba
+  labels:
+    app: ueba-pipeline
+    component: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: ueba-pipeline
+    component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+
+---
+# PostgreSQL StatefulSet with PVC
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: ueba
+  labels:
+    app: ueba-pipeline
+    component: postgres
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ueba-pipeline
+      component: postgres
+  template:
+    metadata:
+      labels:
+        app: ueba-pipeline
+        component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ueba-db-credentials
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ueba-db-credentials
+                  key: password
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: ueba-db-config
+                  key: database
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: init-script
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - flink
+                - -d
+                - ueba
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - flink
+                - -d
+                - ueba
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        - name: init-script
+          configMap:
+            name: postgres-init-script
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+        labels:
+          app: ueba-pipeline
+          component: postgres
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi
